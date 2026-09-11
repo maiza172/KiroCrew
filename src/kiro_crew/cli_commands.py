@@ -51,10 +51,12 @@ from kiro_crew.config.loader import (
     KiroCrewAgentConfig,
     KiroCrewConfig,
     WorkspaceConfig,
+    WorkspaceDirUnusable,
     build_provider_factory,
     coerce_dict_section,
     config_local_path,
     config_path,
+    materialize_workspace_dir,
     read_config_for_update,
     read_local_secret,
     update_config_locked,
@@ -141,6 +143,18 @@ _TERMINAL_CTRL_RE = re.compile(
 
 def _ws_dir_error(given: str) -> str:
     return _WS_DIR_OUTSIDE_HOME.format(home=config_dir(), given=given)
+
+
+def _cli_workspace_dst(ws_dir: str) -> Path:
+    """The directory a CLI workspace ``dir`` names, composed as the validator judged it.
+
+    ``~`` is expanded and an absolute dir is taken as given; only a relative dir is
+    joined onto the data home. ``config_dir() / "~/x"`` would yield ``<home>/~/x``
+    -- a path the containment check never looked at -- so a dir that passed
+    validation must be materialized and checked as the same path it was validated as.
+    """
+    raw = Path(ws_dir).expanduser()
+    return raw if raw.is_absolute() else config_dir() / ws_dir
 
 
 def _ws_dir_resolves_inside_home(ws_dir: str) -> bool:
@@ -500,6 +514,14 @@ def _handle_workspace(args: argparse.Namespace) -> None:
                 )
                 print("Error: cannot use config root as workspace directory", file=sys.stderr)
                 sys.exit(1)
+            # Defined for BOTH branches, so the destination is never an
+            # undefined name in the rollback closure below. Composed the way
+            # _ws_dir_resolves_inside_home judged it: ``~`` expanded and an
+            # absolute dir taken as given, so a dir that passed validation is the
+            # directory that gets created, not ``<home>/~/...``. Resolved HERE and
+            # never again: the create pins this parent chain, so a component
+            # swapped for a link after this point is refused, not followed.
+            dst_path = _cli_workspace_dst(ws_dir).resolve()
         # Check for directory collision with existing workspaces
         existing_dirs = {ws.dir for ws in cfg.workspaces.values()}
         if ws_dir in existing_dirs:
@@ -535,6 +557,16 @@ def _handle_workspace(args: argparse.Namespace) -> None:
                         "choose another dir or remove it first"
                     ) from exc
                 install_state["installed"] = True
+            # A create with no copy source still needs its directory to EXIST (see
+            # materialize_workspace_dir: the config entry alone is a fleet-wide
+            # private-memory outage). Created through the pinned parent, adopting a
+            # directory already there; deliberately NOT rolled back on a failed
+            # write -- a concurrent create can already have adopted and registered it.
+            else:
+                try:
+                    materialize_workspace_dir(dst_path, display=ws_dir)
+                except WorkspaceDirUnusable as exc:
+                    raise _CliConflict(str(exc)) from exc
             workspaces[args.name] = dataclasses.asdict(WorkspaceConfig(dir=ws_dir))
             return doc
 
@@ -544,7 +576,16 @@ def _handle_workspace(args: argparse.Namespace) -> None:
 
         def _rollback_install() -> None:
             if install_state["installed"]:
-                shutil.rmtree(dst_path, ignore_errors=True)
+                # Same rule as the dashboard handler and as the plain-create
+                # directory: an installed tree is left in place. A concurrent create
+                # can already have adopted and registered it (EEXIST is accepted),
+                # so deleting it would leave that workspace declared with no
+                # directory. Say where it is; a silent orphan reads as a leak.
+                print(
+                    f"Note: leaving '{dst_path}' in place; the workspace was not "
+                    "registered and no entry names it.",
+                    file=sys.stderr,
+                )
             elif staged_path is not None:
                 shutil.rmtree(staged_path, ignore_errors=True)
 
@@ -610,6 +651,16 @@ def _handle_workspace(args: argparse.Namespace) -> None:
                 if args.dir in used:
                     raise _CliConflict(
                         f"directory '{args.dir}' is already used by another workspace"
+                    )
+                # Same materialize-or-refuse invariant the create path holds: the
+                # V2 private-memory layout resolves EVERY declared workspace
+                # strictly, so rebinding to a path that is not a directory arms a
+                # refusal for every private member. An update names a destination
+                # the owner already chose, so it refuses rather than creating one.
+                if not _cli_workspace_dst(args.dir).is_dir():
+                    raise _CliConflict(
+                        f"directory '{args.dir}' does not exist or is not a "
+                        "directory; create it first"
                     )
                 entry["dir"] = args.dir
             return doc
